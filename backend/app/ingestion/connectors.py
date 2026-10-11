@@ -9,7 +9,8 @@ from urllib.parse import quote, urlencode, urljoin
 from bs4 import BeautifulSoup
 
 from app.config import Settings
-from app.ingestion.http import PublicClient, SourceError
+from app.ingestion.http import PublicClient, SourceError, response_error
+from app.ingestion.browser import BrowserSearch, EMPTY, parse_cards, page_error
 from app.ingestion.normalize import NormalizedJob, number, parse_salary, plain
 
 
@@ -52,20 +53,37 @@ def parse_104(item):
 
 
 class Source104(Connector):
+    def __init__(self, settings):
+        super().__init__(settings)
+        self.browser_search = BrowserSearch("104", settings)
+        self.browser_mode = False
+        self.session_loaded = False
+
     async def collect(self, keyword):
         seen = set()
         for page in range(1, self.settings.max_pages_per_keyword + 1):
             params = dict(keyword=keyword, page=page, order=15, asc=0, mode="s", jobsource="2018indexpoc")
-            response = await self.http.get("https://www.104.com.tw/jobs/search/api/jobs", params=params, headers={"Referer": "https://www.104.com.tw/jobs/search/", "Accept": "application/json, text/plain, */*"})
-            try:
-                rows = extract_104(response.json())
-            except json.JSONDecodeError as exc:
-                raise SourceError("104 沒有回傳職缺 JSON，可能需要驗證") from exc
+            search_url = "https://www.104.com.tw/jobs/search/?" + urlencode(params)
+            rows = None
+            if not self.browser_mode:
+                try:
+                    if not self.session_loaded:
+                        await self.http.get(search_url)
+                        self.session_loaded = True
+                    response = await self.http.get("https://www.104.com.tw/jobs/search/api/jobs", params=params, headers={"Referer": search_url, "Accept": "application/json, text/plain, */*"})
+                    rows = [parse_104(item) for item in extract_104(response.json())]
+                except (SourceError, ValueError):
+                    # One ordinary browser context per round, reused only if it works.
+                    self.browser_mode = True
+            if self.browser_mode:
+                body, payload = await self.browser_search.load(search_url)
+                rows = [parse_104(item) for item in payload] if payload is not None else parse_cards(body, "104")
+                if not rows and payload is None and not EMPTY.search(plain(body)):
+                    raise page_error(body, self.settings)
             if not rows:
                 return
             new = 0
-            for item in rows:
-                job = parse_104(item)
+            for job in rows:
                 if job.external_id not in seen:
                     seen.add(job.external_id)
                     new += 1
@@ -74,10 +92,12 @@ class Source104(Connector):
                     self.truncated = True
                     return
             if not new:
-                self.truncated = True
-                raise SourceError("104 分頁重複，已停止以避免無限收集")
-            await asyncio.sleep(self.settings.request_delay_seconds)
+                raise SourceError("104 分頁重複，已停止收集", "pagination_repeated")
         self.truncated = True
+
+    async def close(self):
+        await self.browser_search.close()
+        await super().close()
 
 
 def extract_cake(body, page, include_pagination=False):
@@ -153,61 +173,24 @@ class Cake(Connector):
 
 
 def parse_1111(body):
-    soup = BeautifulSoup(body, "html.parser")
-    cards = soup.select(".item__job")
-    jobs = []
-    for card in cards:
-        link = card.select_one('.job_item_info a[href*="/job/"]')
-        title = card.select_one(".card-title")
-        company = card.select_one(".job_item_company")
-        location = card.select_one(".job_item_detail a")
-        salary = card.select_one(".job_item_detail_salary")
-        if not all((link, title, company)):
-            raise SourceError("1111 職缺卡片欄位已變更")
-        url = urljoin("https://www.1111.com.tw", link["href"])
-        match = re.search(r"/job/(\d+)", url)
-        if not match:
-            continue
-        jobs.append(NormalizedJob(source="1111", external_id=match.group(1), title=title.get_text(" ", strip=True), company=company.get_text(" ", strip=True).split("｜")[0].split("|")[0].strip(), location=location.get_text(" ", strip=True) if location else "", url=url, description=plain(card), **parse_salary(salary.get_text(" ", strip=True) if salary else "薪資未提供")))
-    return jobs
+    return parse_cards(body, "1111")
 
 
 class Source1111(Connector):
     def __init__(self, settings):
         super().__init__(settings)
-        self.playwright = self.browser = self.page = None
-
-    async def browser_html(self, url):
-        from playwright.async_api import async_playwright, TimeoutError as BrowserTimeout
-        if not self.browser:
-            self.playwright = await async_playwright().start()
-            self.browser = await self.playwright.chromium.launch(headless=True)
-            self.page = await self.browser.new_page(locale="zh-TW")
-        response = await self.page.goto(url, wait_until="domcontentloaded", timeout=int(self.settings.request_timeout_seconds * 1000))
-        if response and response.status in (403, 401, 452):
-            raise SourceError(f"公開資料存取被拒絕（HTTP {response.status}）")
-        try:
-            await self.page.wait_for_selector(".item__job", timeout=int(self.settings.request_timeout_seconds * 1000))
-        except BrowserTimeout:
-            text = await self.page.locator("body").inner_text()
-            if not re.search(r"沒有符合|查無|0\s*筆", text):
-                raise SourceError("1111 一般瀏覽器仍停留在載入／驗證頁") from None
-        return await self.page.content()
+        self.browser_search = BrowserSearch("1111", settings)
 
     async def collect(self, keyword):
         seen = set()
         for page in range(1, self.settings.max_pages_per_keyword + 1):
             url = "https://www.1111.com.tw/search/job?" + urlencode({"ks": keyword, "page": page, "col": "da"})
-            try:
-                body = (await self.http.get(url)).text
-            except SourceError:
-                body = ""
+            body, _ = await self.browser_search.load(url)
             rows = parse_1111(body)
             if not rows:
-                body = await self.browser_html(url)
-                rows = parse_1111(body)
-            if not rows:
-                return
+                if EMPTY.search(plain(body)):
+                    return
+                raise page_error(body, self.settings)
             new = 0
             for job in rows:
                 if job.external_id not in seen:
@@ -218,15 +201,11 @@ class Source1111(Connector):
                     self.truncated = True
                     return
             if not new:
-                raise SourceError("1111 分頁重複，已停止收集")
-            await asyncio.sleep(self.settings.request_delay_seconds)
+                raise SourceError("1111 分頁重複，已停止收集", "pagination_repeated")
         self.truncated = True
 
     async def close(self):
-        if self.browser:
-            await self.browser.close()
-        if self.playwright:
-            await self.playwright.stop()
+        await self.browser_search.close()
         await super().close()
 
 
@@ -245,34 +224,41 @@ class JobSpyConnector(Connector):
     def __init__(self, source, settings):
         super().__init__(settings)
         self.source = source
+        self.last_error = None
 
     def scrape(self, keyword):
         from jobspy import scrape_jobs
-        from jobspy.util import RequestsRotating
+        from jobspy.util import RequestsRotating, TLSRotating
         capture = ErrorCapture()
         logger = logging.getLogger(f"JobSpy:{'LinkedIn' if self.source == 'linkedin' else 'Indeed'}")
         logger.addHandler(capture)
-        original = RequestsRotating.request
+        originals = {RequestsRotating: RequestsRotating.request, TLSRotating: TLSRotating.request}
         next_request = 0.0
+        self.last_error = None
 
         def paced(session, method, url, **kwargs):
             nonlocal next_request
-            if any(re.search(r"status code (?:403|429)\b", message) for message in capture.messages):
+            if self.last_error or any(re.search(r"status code (?:403|429)\b", message) for message in capture.messages):
                 raise SourceError("本次來源已拒絕請求，停止後續網路存取")
             time.sleep(max(0, next_request - time.monotonic()))
             kwargs.setdefault("timeout", self.settings.request_timeout_seconds)
             try:
-                return original(session, method, url, **kwargs)
+                response = originals[type(session)](session, method, url, **kwargs)
+                if response.status_code in (401, 403, 429, 452):
+                    self.last_error = response_error(response.status_code, self.settings, response.headers.get("Retry-After"))
+                return response
             finally:
                 next_request = time.monotonic() + self.settings.request_delay_seconds
 
         RequestsRotating.request = paced
+        TLSRotating.request = paced
         try:
-            frame = scrape_jobs(site_name=[self.source], search_term=keyword, location=self.settings.collect_location, country_indeed="Taiwan", results_wanted=self.settings.max_results_per_keyword, enforce_annual_salary=False, description_format="plain", fetch_description=self.source == "linkedin", verbose=1)
+            frame = scrape_jobs(site_name=[self.source], search_term=keyword, location=self.settings.collect_location, country_indeed="Taiwan", results_wanted=self.settings.max_results_per_keyword, enforce_annual_salary=False, description_format="plain", fetch_description=False, verbose=1)
             # Replace Pandas NaN/NaT without leaking non-finite values into JSON.
             records = json.loads(frame.to_json(orient="records", date_format="iso"))
         finally:
-            RequestsRotating.request = original
+            for kind, original in originals.items():
+                kind.request = original
             logger.removeHandler(capture)
         return records, capture.messages
 
@@ -290,9 +276,13 @@ class JobSpyConnector(Connector):
                     amount += f"–{high:,.0f}"
                 text = f"{row.get('currency') or ''} {amount} / {row.get('interval') or '週期未提供'}"
             posted = row.get("date_posted")
-            yield NormalizedJob(source=self.source, external_id=str(row.get("id") or ""), title=row.get("title") or "", company=row.get("company") or "", location=row.get("location") or "", url=row.get("job_url") or "", description=row.get("description") or "", salary_text=text, salary_currency=row.get("currency"), salary_period=period, salary_min=low, salary_max=high, source_updated_at=datetime.fromisoformat(posted.replace("Z", "+00:00")) if posted else None)
+            yield NormalizedJob(source=self.source, external_id=str(row.get("id") or ""), title=row.get("title") or "", company=row.get("company") or "", location=row.get("location") or "", url=row.get("job_url") or "", description=row.get("description") or "", salary_text=text, salary_currency=row.get("currency"), salary_period=period, salary_min=low, salary_max=high, source_updated_at=datetime.fromisoformat(posted.replace("Z", "+00:00")) if posted else None, update_mode="listing" if self.source == "linkedin" else "full", detail_status="pending" if self.source == "linkedin" else "complete")
+        if self.last_error:
+            raise self.last_error
         if errors:
             statuses = [match.group(1) for message in errors if (match := re.search(r"status code (\d+)", message))]
+            if any(status in ("403", "429", "452", "401") for status in statuses):
+                raise response_error(int(next(status for status in statuses if status in ("403", "429", "452", "401"))), self.settings)
             raise SourceError("JobSpy 來源請求失敗" + (f"（HTTP {','.join(dict.fromkeys(statuses))}）" if statuses else "，未將空結果視為成功"))
 
 

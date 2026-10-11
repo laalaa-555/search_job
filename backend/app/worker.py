@@ -65,7 +65,11 @@ async def run_source(source, trigger, settings, semaphore):
             if state is None:
                 state = SourceState(source=source)
                 db.add(state)
+            if state.next_retry_at and state.next_retry_at.replace(tzinfo=utcnow().tzinfo) > utcnow():
+                log.info("%s cooling down until %s; skipped", source, state.next_retry_at)
+                return
             state.status, state.error, state.truncated = "running", None, False
+            state.reason_code, state.next_retry_at = None, None
             state.last_started_at = utcnow()
             state.collected_count, state.keywords_completed, state.keywords_total = 0, 0, len(settings.keywords)
             run = CollectionRun(source=source, trigger=trigger)
@@ -77,7 +81,7 @@ async def run_source(source, trigger, settings, semaphore):
         finished = None
         seen = set()
         try:
-            process = await asyncio.create_subprocess_exec(sys.executable, "-m", "app.ingestion.runner", "--source", source, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=1024 * 1024)
+            process = await asyncio.create_subprocess_exec(sys.executable, "-m", "app.ingestion.runner", "--source", source, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=1024 * 1024)
 
             async def stderr_log():
                 # Drain to avoid deadlocks; only log bounded diagnostic lines.
@@ -86,18 +90,23 @@ async def run_source(source, trigger, settings, semaphore):
 
             drain = asyncio.create_task(stderr_log())
             try:
-                async with asyncio.timeout(settings.source_timeout_seconds):
+                async with asyncio.timeout(settings.for_source(source).source_timeout_seconds):
                     while line := await process.stdout.readline():
                         event = json.loads(line.decode("utf-8"))
                         with SessionLocal() as db:
                             state = db.get(SourceState, source)
-                            if event["type"] == "job":
+                            if event["type"] in ("job", "detail"):
                                 job = NormalizedJob.model_validate(event["job"])
                                 if job.source != source:
                                     raise ValueError("Source process emitted a different source")
                                 upsert_job(db, job)
-                                seen.add(job.external_id)
-                                state.collected_count = len(seen)
+                                if event["type"] == "job":
+                                    seen.add(job.external_id)
+                                    state.collected_count = len(seen)
+                                state.last_data_at = utcnow()
+                            elif event["type"] == "lists_finished":
+                                process.stdin.write(b"lists_saved\n")
+                                await process.stdin.drain()
                             elif event["type"] == "progress":
                                 state.keywords_completed = event["completed"]
                             elif event["type"] == "finished":
@@ -126,6 +135,10 @@ async def run_source(source, trigger, settings, semaphore):
                 run = db.get(CollectionRun, run_id)
                 state.status = run.status = (finished or {}).get("status", "interrupted")
                 state.error = run.error = (finished or {}).get("error")
+                state.reason_code = (finished or {}).get("reason_code")
+                cooldown = (finished or {}).get("cooldown_seconds", 0)
+                if cooldown:
+                    state.next_retry_at = utcnow() + timedelta(seconds=cooldown)
                 state.last_finished_at = run.finished_at = utcnow()
                 state.collected_count = run.collected_count = len(seen)
                 state.truncated = (finished or {}).get("truncated", False)

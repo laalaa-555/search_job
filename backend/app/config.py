@@ -27,6 +27,28 @@ class Settings(BaseSettings):
     source_timeout_seconds: float = Field(default=1800, gt=0)
     worker_lock_seconds: int = Field(default=120, ge=30)
     status_stale_days: int = Field(default=7, ge=1)
+    source_request_delays: dict[str, float] = Field(default_factory=lambda: {"linkedin": 10})
+    source_request_timeouts: dict[str, float] = Field(default_factory=dict)
+    source_timeouts: dict[str, float] = Field(default_factory=lambda: {"linkedin": 3600})
+    linkedin_detail_limit: int = Field(default=20, ge=0, le=100)
+    linkedin_detail_refresh_days: int = Field(default=7, ge=1)
+    rate_limit_cooldown_seconds: int = Field(default=3600, ge=3600)
+    blocked_cooldown_seconds: int = Field(default=86400, ge=1)
+
+    @field_validator("source_request_delays", "source_request_timeouts", "source_timeouts")
+    @classmethod
+    def valid_overrides(cls, value, info):
+        import math
+        if set(value) - SOURCES.keys() or any(not math.isfinite(n) or n < 0 or (n == 0 and info.field_name != "source_request_delays") for n in value.values()):
+            raise ValueError("Source overrides must use known sources and valid durations")
+        return value
+
+    def for_source(self, source: str):
+        return self.model_copy(update={
+            "request_delay_seconds": self.source_request_delays.get(source, self.request_delay_seconds),
+            "request_timeout_seconds": self.source_request_timeouts.get(source, self.request_timeout_seconds),
+            "source_timeout_seconds": self.source_timeouts.get(source, self.source_timeout_seconds),
+        })
 
     @field_validator("enabled_sources")
     @classmethod

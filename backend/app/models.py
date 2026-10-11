@@ -40,6 +40,8 @@ class Job(Base):
     content_hash: Mapped[str] = mapped_column(String(64))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     source_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    detail_status: Mapped[str] = mapped_column(String(20), default="complete")
+    detail_collected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -63,6 +65,9 @@ class SourceState(Base):
     keywords_total: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    reason_code: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_data_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class CollectionRun(Base):

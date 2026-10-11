@@ -6,6 +6,11 @@ import type { Job, JobPage, SourceReport } from './types';
 
 const cities = ['台北市','新北市','桃園市','台中市','台南市','高雄市','新竹市','新竹縣','基隆市','宜蘭縣','苗栗縣','彰化縣','南投縣','雲林縣','嘉義市','嘉義縣','屏東縣','花蓮縣','台東縣','澎湖縣','金門縣','連江縣','遠端','其他'];
 const statusNames: Record<string,string> = {idle:'等待收集',running:'收集中',success:'更新完成',partial:'部分更新',error:'更新失敗',disabled:'已停用',interrupted:'收集中斷'};
+const reasonNames: Record<string,string> = {rate_limited:'來源限流',access_denied:'來源拒絕存取',verification_required:'需要人工驗證',loading_timeout:'網頁載入受阻',format_changed:'網頁結構改版',pagination_repeated:'來源分頁重複'};
+
+function coolingDown(value: string | null) {
+  return Boolean(value && new Date(/Z$|[+-]\d\d:\d\d$/.test(value) ? value : `${value}Z`).getTime() > Date.now());
+}
 
 function timeLabel(value: string | null) {
   if (!value) return '尚未成功更新';
@@ -137,6 +142,7 @@ export default function App() {
         {job.salary_estimated && <p className="salary-note">依月薪 × 12 換算，不含未明載獎金</p>}
         {job.annual_salary_min === null && !/面議|未提供|negotiable/i.test(job.salary_text) && <p className="salary-note">此薪資未換算為新台幣年薪</p>}
         {job.stale && <p className="stale-note">資料較舊 · 最後收集 {timeLabel(job.last_seen_at)}</p>}
+        {job.detail_status === 'pending' && <p className="salary-note">詳情尚未取得</p>}
         {!job.is_active && <p className="stale-note">來源已標示此職缺下架</p>}
       </article>)}</div>
       {totalPages > 1 && <nav className="pagination" aria-label="分頁"><button aria-label="上一頁" disabled={page <= 1 || loading} onClick={() => setPage(value => value - 1)}><ChevronLeft size={17}/></button><span>第 {page} / {totalPages} 頁</span><button aria-label="下一頁" disabled={page >= totalPages || loading} onClick={() => setPage(value => value + 1)}><ChevronRight size={17}/></button></nav>}
@@ -144,7 +150,7 @@ export default function App() {
       <section className="updates" aria-label="資料更新狀態">
         <div className="updates-heading"><h2><RefreshCw size={14} className={running ? 'spin-slow' : ''}/>資料更新</h2><span>{report ? `每日 ${String(report.schedule_hour).padStart(2,'0')}:${String(report.schedule_minute).padStart(2,'0')} · 台北時間` : '啟動 Worker 後更新'}</span></div>
         {statusError && <p className="status-error" role="alert">{statusError}</p>}
-        <div className="status-grid">{report?.items.map(source => <div className={`source-status ${source.status}`} key={source.source}><div><strong>{source.label}</strong><span className="status-label"><i/>{statusNames[source.status] || source.status}</span></div><p>{source.status === 'running' ? `${source.collected_count} 筆 · 關鍵字 ${source.keywords_completed}/${source.keywords_total}` : `${source.stored_count} 筆 · ${timeLabel(source.last_success_at)}`}</p>{source.error && <details><summary>查看原因</summary><p>{source.error}</p></details>}{source.truncated && <small>已達本次收集上限</small>}</div>)}</div>
+        <div className="status-grid">{report?.items.map(source => <div className={`source-status ${source.status}`} key={source.source}><div><strong>{source.label}</strong><span className="status-label"><i/>{statusNames[source.status] || source.status}</span></div><p>{source.status === 'running' ? `${source.collected_count} 筆 · 關鍵字 ${source.keywords_completed}/${source.keywords_total}` : `${source.stored_count} 筆 · 完整更新 ${timeLabel(source.last_success_at)}`}</p>{source.last_data_at && <small>最後取得資料 {timeLabel(source.last_data_at)}</small>}{source.reason_code && <small>{reasonNames[source.reason_code] || '來源收集異常'}</small>}{coolingDown(source.next_retry_at) && <small>冷卻中 · {timeLabel(source.next_retry_at)} 後可再嘗試</small>}{source.error && <details><summary>查看原因</summary><p>{source.error}</p></details>}{source.truncated && <small>已達本次收集上限</small>}</div>)}</div>
         {hasFailures && <p className="update-note">部分來源尚未完成更新，已儲存的職缺仍可搜尋。</p>}
         <button className="coverage-button" aria-expanded={showCoverage} onClick={() => setShowCoverage(value => !value)}>{showCoverage ? '收起' : '查看'}資料涵蓋範圍<ChevronDown size={13}/></button>
         {showCoverage && <div className="coverage"><p>每次啟動 Worker 立即收集，並依每日排程更新。搜尋範圍為已存入資料庫的職缺，每個來源／關鍵字最多 {report?.max_results_per_keyword || 100} 筆。</p><p>地區：{report?.location || 'Taiwan'}。關鍵字：{report?.keywords.join('、') || '載入中'}。</p><p>本機關機期間不更新，下次啟動時重新收集。</p></div>}

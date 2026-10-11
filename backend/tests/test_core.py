@@ -208,6 +208,7 @@ def test_jobspy_rate_limit_warning_stops_further_requests(monkeypatch):
             return "[]"
 
     def scrape(**kwargs):
+        assert kwargs["fetch_description"] is False
         session = RequestsRotating()
         session.request("GET", "https://www.linkedin.com/jobs/1")
         with pytest.raises(SourceError):

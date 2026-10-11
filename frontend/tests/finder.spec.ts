@@ -118,3 +118,16 @@ test('removing the last bookmark on page two returns to page one', async ({page}
   await expect(page.locator('.job-card')).toHaveCount(20);
   await expect(page.locator('.pagination')).toHaveCount(0);
 });
+
+test('cooldown and pending detail are visible while stored jobs remain searchable', async ({page}) => {
+  await mockedApi(page);
+  await page.route('**/api/v1/sources', route => route.fulfill({json:{items:[{source:'linkedin',label:'LinkedIn',enabled:true,status:'partial',reason_code:'rate_limited',next_retry_at:'2099-10-11T00:00:00Z',last_data_at:'2026-10-11T00:00:00Z',last_success_at:null,last_finished_at:'2026-10-11T00:00:00Z',collected_count:1,stored_count:1,keywords_completed:1,keywords_total:1,error:'HTTP 429',truncated:false}],keywords:['Data Scientist'],location:'Taiwan',max_results_per_keyword:100,schedule_timezone:'Asia/Taipei',schedule_hour:6,schedule_minute:0,worker_running:false}}));
+  await page.route('**/api/v1/jobs?**', route => route.fulfill({json:{items:[{...makeJob(1,'Data Scientist','linkedin','台北市',null),url:'https://www.linkedin.com/jobs/view/1',detail_status:'pending',detail_collected_at:null}],total:1,page:1,page_size:20}}));
+  await page.goto('/');
+  await expect(page.getByText('詳情尚未取得',{exact:true})).toBeVisible();
+  await expect(page.getByText('來源限流',{exact:true})).toBeVisible();
+  await expect(page.getByText(/冷卻中 ·/)).toBeVisible();
+  await expect(page.getByText(/最後取得資料/)).toBeVisible();
+  await expect(page.locator('.job-card')).toHaveCount(1);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth)).toBe(false);
+});

@@ -59,6 +59,13 @@ PostgreSQL 使用持久化 volume；`down`、容器重建與 Worker 重啟保留
 | `SOURCE_TIMEOUT_SECONDS` | 每來源執行上限，預設 1800 秒；逾時保留已寫入資料 |
 | `WORKER_LOCK_SECONDS` | 資料庫租約期限，預設 120 秒，執行中定期續租 |
 | `STATUS_STALE_DAYS` | 最後收集超過此天數顯示資料較舊，預設 7 天 |
+| `SOURCE_REQUEST_DELAYS` | JSON 物件，指定來源請求間隔；預設 `{"linkedin":10}`，其他來源使用全域間隔 |
+| `SOURCE_REQUEST_TIMEOUTS` | JSON 物件，指定來源請求逾時；預設 `{}`，使用全域逾時 |
+| `SOURCE_TIMEOUTS` | JSON 物件，指定來源整輪執行上限；預設 `{"linkedin":3600}` |
+| `LINKEDIN_DETAIL_LIMIT` | 列表完成後每輪詳情上限，預設 20；0 停用詳情收集 |
+| `LINKEDIN_DETAIL_REFRESH_DAYS` | 成功取得詳情後多久可重抓，預設 7 天 |
+| `RATE_LIMIT_COOLDOWN_SECONDS` | 429 冷卻至少一小時，採用此值與 `Retry-After` 的較大值 |
+| `BLOCKED_COOLDOWN_SECONDS` | 403／452／驗證頁及載入受阻冷卻，預設一天 |
 | `CORS_ORIGINS` | 原生前端開發允許的來源 |
 | `VITE_API_BASE_URL` | Vite 開發時的公開 API 路徑，預設 `/api/v1` |
 
@@ -73,19 +80,21 @@ Docker 前端使用同源 `/api/v1` 與 Nginx 代理。API 來源憑證、資料
 - 去重鍵為來源與原始職缺 ID。同職缺出現在不同來源時保留各來源紀錄。
 - 已達筆數或分頁上限會標示，資料庫不代表來源全部職缺。
 - 一次未出現或來源失敗，不視為下架；資料較舊以最後看見時間提示。
+- LinkedIn 先收集列表，再補充有限筆數的詳情；尚未取得時顯示「詳情尚未取得」。列表缺少薪資、描述或技能不清空既有詳情。
+- 冷卻期限保存於資料庫，重啟不會解除。期限過後，在下次 Worker 啟動或每日排程才再次嘗試，沒有額外的每小時重試排程。
 
 ## 資料來源與實測狀態
 
 五個來源都有獨立連接器。外部網站會改版、限制請求或要求驗證；程式清楚回報失敗，既有資料仍可查詢。
 
-2026-10-11 已實測 Cake、LinkedIn、Indeed 的真實職缺並寫入 PostgreSQL。104 回傳 HTTP 403／驗證頁，1111 一般 Chromium 仍停在載入／驗證頁；這兩站尚未通過真實接入驗收。LinkedIn 詳情請求曾回傳 429，會保留列表資料、停止後續請求並標示部分更新。五站全部成功的最終驗收仍未達成，詳見 `modify.md`。
+2026-10-11 修正後已重新實測 Windows 與 Compose：104 仍回傳 403／安全驗證，1111 在正常等待後仍停在空白 Loading 頁。LinkedIn 小批量 5 筆成功，預設範圍第二次列表請求仍回傳 429，保存本輪 10 筆並進入一小時冷卻。Cake 曾完成全關鍵字更新，本次恢復 Worker 後也收到 429；Indeed 本次全關鍵字成功。五站全部成功的最終驗收仍未達成，詳見 `modify.md`。
 
-- 104：HTTP 讀取公開網頁使用的非官方 JSON 介面，參考 [tw-job-scraper](https://github.com/kengkeng44/tw-job-scraper)。
-- LinkedIn、Indeed：[JobSpy](https://github.com/speedyapply/JobSpy)；保存來源原始職缺網址。JobSpy 可能用 log 回報錯誤而回傳空列表，連接器會捕捉並標為失敗／部分成功。
+- 104：先建立一般 HTTP Session，再讀取網站內部 JSON；失敗時以普通 Playwright 讀取搜尋頁實際取得的 JSON 或職缺卡片。參考 [tw-job-scraper](https://github.com/kengkeng44/tw-job-scraper)，沒有使用官方開發者授權 API。
+- LinkedIn、Indeed：[JobSpy](https://github.com/speedyapply/JobSpy)；捕捉 requests／curl HTTP 狀態及 `Retry-After`，不把失敗當空結果。LinkedIn 關閉 JobSpy 的逐筆詳情；所有列表關鍵字完成並確認寫入後，優先補充本輪看見、尚未取得或超過七天的詳情。完整列表仍可能限流。
 - Cake：解析真正關鍵字路徑的 Next.js 搜尋資料，按 pageMap 取當頁結果，排除其他來源的轉載。
-- 1111：公開頁面解析；需要 JS 時使用一般 Chromium。停留在驗證或載入頁時回報失敗。
+- 1111：一般 Chromium 載入公開搜尋頁，解析 JSON-LD 或可辨識卡片。判斷驗證頁使用實際可見文字，避免把隱藏錯誤訊息誤判成需要人工驗證；載入逾時與結構改版分開回報。目前無法取得真實卡片，因此新版欄位與分頁仍待實測。
 
-`scripts/inspect_sources.py`、`probe_cake.py`、`probe_browser.py` 是來源診斷工具。診斷輸出與原始頁面保存於忽略目錄，勿提交到 Git。
+`scripts/inspect_sources.py`、`probe_cake.py`、`probe_browser.py`、`probe_recovery.py` 是隔離的來源診斷工具，不寫入正式職缺。診斷輸出與原始頁面保存於忽略目錄，勿提交到 Git。正式收集使用 Worker，遵守租約與資料庫冷卻；不要反覆執行診斷工具測試受阻來源。
 
 ## 本機開發與 SQLite
 
@@ -136,7 +145,7 @@ E2E 預設測試 Compose 的 `http://127.0.0.1:3000`，使用隔離的 API 測�
 
 PostgreSQL 測試只能指定名稱以 `test_` 開頭的獨立資料庫；測試會建立與清除該資料庫中的測試表。執行 `docker compose exec -T api python test_postgres.py` 可在 Compose 內建立 `test_jobs`，執行與 SQLite 相同的測試。測試程序的預設應用資料庫另設為空白記憶體 DB，讓誤用正式 Session factory 的測試立即失敗。CI 也執行兩種資料庫測試。
 
-已通過 SQLite 19 項、PostgreSQL 19 項、桌面／手機 E2E 14 項與 Compose 建置。真實資料的容器重啟驗證可在根目錄執行：
+本次已通過 SQLite 39 項、PostgreSQL 39 項、桌面／手機 E2E 16 項與 Compose 建置。包含 SQLite 舊版 migration 升級保留資料與收藏。真實資料的容器重啟驗證可在根目錄執行：
 
 ```powershell
 .\.venv\Scripts\python.exe scripts/verify_local.py

@@ -26,6 +26,8 @@ class JobOut(BaseModel):
     updated_at: datetime
     bookmarked: bool = False
     stale: bool = False
+    detail_status: str = "complete"
+    detail_collected_at: datetime | None = None
 
 
 class JobDetail(JobOut):
@@ -55,6 +57,9 @@ class SourceOut(BaseModel):
     keywords_total: int = 0
     error: str | None = None
     truncated: bool = False
+    reason_code: str | None = None
+    next_retry_at: datetime | None = None
+    last_data_at: datetime | None = None
 
 
 class SourcesOut(BaseModel):

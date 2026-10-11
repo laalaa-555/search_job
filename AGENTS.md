@@ -11,6 +11,8 @@
 7. 修改後執行 backend 測試與 frontend build；整合變更執行 Compose 與瀏覽器驗證。
 8. 在 modify.md 記錄改動及驗證。實際犯錯時，將原因、修正及預防寫入 lesson.md。
 9. 提交前檢查 staged diff；使用簡單中文 commit。未獲使用者要求不可刪除持久化 volume。
+10. 遵守來源 next_retry_at；重啟不可清除冷卻。LinkedIn 列表先 commit 並回覆 lists_saved，之後才收集有限詳情；缺少欄位不清空既有值。
+11. 瀏覽器驗證／零結果判斷使用可見文字，不能依隱藏訊息判斷。104／1111 在目前環境仍受阻，解析 fixture 通過不可當真實驗收。
 
 ## 標準驗證
 

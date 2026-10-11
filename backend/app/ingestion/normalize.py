@@ -5,6 +5,7 @@ import re
 from datetime import datetime
 from html import unescape
 from urllib.parse import urlsplit, urlunsplit
+from typing import Literal
 
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field, field_validator
@@ -87,6 +88,9 @@ class NormalizedJob(BaseModel):
     salary_estimated: bool = False
     is_active: bool = True
     source_updated_at: datetime | None = None
+    detail_status: str = "complete"
+    detail_collected_at: datetime | None = None
+    update_mode: Literal["full", "listing", "details"] = "full"
 
     @field_validator("url")
     @classmethod
@@ -95,7 +99,7 @@ class NormalizedJob(BaseModel):
         allowed = SOURCE_HOSTS.get(info.data.get("source"), ())
         if parts.scheme not in ("http", "https") or not any(parts.hostname == host or (parts.hostname or "").endswith("." + host) for host in allowed):
             raise ValueError("Job URL must belong to its source")
-        return urlunsplit(("https", parts.netloc, parts.path, parts.query, ""))
+        return urlunsplit(("https", parts.netloc, parts.path, "" if info.data.get("source") in ("104", "1111") else parts.query, ""))
 
     def finalize(self):
         self.title = plain(self.title)[:500]
@@ -119,7 +123,7 @@ class NormalizedJob(BaseModel):
         return self
 
     def storage_values(self) -> dict:
-        values = self.model_dump()
+        values = self.model_dump(exclude={"update_mode"})
         values["search_text"] = " ".join([self.title, self.company, self.description, " ".join(self.skills)]).lower().replace("臺", "台")
-        values["content_hash"] = hashlib.sha256(json.dumps(self.model_dump(mode="json"), ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        values["content_hash"] = hashlib.sha256(json.dumps(self.model_dump(mode="json", exclude={"update_mode", "detail_collected_at"}), ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         return values
