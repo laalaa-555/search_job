@@ -25,6 +25,8 @@ class Connector:
 
 
 def extract_104(payload):
+    if not isinstance(payload, dict):
+        raise SourceError("104 回應格式已變更，JSON 不是物件")
     data = payload.get("data")
     if isinstance(data, list):
         return data

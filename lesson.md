@@ -74,3 +74,10 @@
 - 原因：helper 的固定 title 與覆寫參數同時透過 kwargs 傳入，產生 TypeError。
 - 修正：先合併預設字典與覆寫值，再建立 NormalizedJob。
 - 預防：測試 helper 使用與原有 fixture 相同的覆寫方式，包含變更職稱案例。
+
+## 2026-10-11：瀏覽器搜尋請求狀態未納入分類
+
+- 錯誤：新增邊界測試證實，104 搜尋 XHR 回傳 429 且 JSON 為空列表時，被當成成功零結果；JSON 頂層為列表時產生未分類 AttributeError。
+- 原因：只检查主文件的 HTTP 狀態，擷取 JSON 時沒有檢查 XHR 狀態；extract_104 假設頂層一定是物件。
+- 修正：搜尋 XHR 的 401／403／429／452 優先回報失敗與冷卻，保留 Retry-After；非物件 JSON 明確回報 format_changed。
+- 預防：回歸測試同時涵蓋主頁與搜尋 XHR，不能用列表為空作為請求成功的證據。

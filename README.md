@@ -145,7 +145,7 @@ E2E 預設測試 Compose 的 `http://127.0.0.1:3000`，使用隔離的 API 測�
 
 PostgreSQL 測試只能指定名稱以 `test_` 開頭的獨立資料庫；測試會建立與清除該資料庫中的測試表。執行 `docker compose exec -T api python test_postgres.py` 可在 Compose 內建立 `test_jobs`，執行與 SQLite 相同的測試。測試程序的預設應用資料庫另設為空白記憶體 DB，讓誤用正式 Session factory 的測試立即失敗。CI 也執行兩種資料庫測試。
 
-本次已通過 SQLite 39 項、PostgreSQL 39 項、桌面／手機 E2E 16 項與 Compose 建置。包含 SQLite 舊版 migration 升級保留資料與收藏。真實資料的容器重啟驗證可在根目錄執行：
+本次已通過 SQLite 41 項、PostgreSQL 41 項、桌面／手機 E2E 16 項與 Compose 建置。包含 SQLite 舊版 migration 升級保留資料與收藏。真實資料的容器重啟驗證可在根目錄執行：
 
 ```powershell
 .\.venv\Scripts\python.exe scripts/verify_local.py

@@ -100,10 +100,13 @@ class BrowserSearch:
             self.browser = await self.playwright.chromium.launch(headless=True)
             self.page = await self.browser.new_page(locale="zh-TW")
         await asyncio.sleep(max(0, self.next_request - time.monotonic()))
-        captured, tasks = [], set()
+        captured, errors, tasks = [], [], set()
         async def capture(response):
             host = urlsplit(response.url).hostname or ""
-            if self.source == "104" and (host == "104.com.tw" or host.endswith(".104.com.tw")) and "search" in response.url and "json" in response.headers.get("content-type", ""):
+            if self.source == "104" and (host == "104.com.tw" or host.endswith(".104.com.tw")) and "search" in response.url and ("api" in response.url or "json" in response.headers.get("content-type", "")):
+                if response.status in (401, 403, 429, 452):
+                    errors.append(response_error(response.status, self.settings, response.headers.get("retry-after")))
+                    return
                 try:
                     from app.ingestion.connectors import extract_104
                     rows = extract_104(await response.json())
@@ -126,11 +129,13 @@ class BrowserSearch:
             deadline = time.monotonic() + self.settings.request_timeout_seconds
             while True:
                 body = await self.page.content()
-                if captured:
-                    return body, captured[-1]
+                if errors:
+                    raise errors[0]
                 text = (await self.page.title() + " " + await self.page.locator("body").inner_text()).strip()
                 if CHALLENGE.search(text):
                     raise page_error(body, self.settings, text)
+                if captured:
+                    return body, captured[-1]
                 if parse_cards(body, self.source) or EMPTY.search(text):
                     return body, None
                 if time.monotonic() >= deadline:

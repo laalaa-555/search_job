@@ -9,8 +9,8 @@ from sqlalchemy import select
 
 from app import worker
 from app.config import Settings
-from app.ingestion.browser import EMPTY, page_error, parse_cards
-from app.ingestion.connectors import Source104, Source1111, JobSpyConnector
+from app.ingestion.browser import BrowserSearch, EMPTY, page_error, parse_cards
+from app.ingestion.connectors import Source104, Source1111, JobSpyConnector, extract_104
 from app.ingestion.http import PublicClient, SourceError, retry_after_seconds
 from app.ingestion.linkedin_details import detail_candidates, fetch_detail
 from app.ingestion.normalize import NormalizedJob
@@ -335,3 +335,43 @@ def test_expired_cooldown_resumes_and_clears_failure(sessions, monkeypatch):
         state=db.get(SourceState,"104")
         assert state.status=="success" and state.last_success_at
         assert state.next_retry_at is None and state.reason_code is None and state.error is None
+
+
+def test_104_non_object_json_is_reported_as_format_change():
+    with pytest.raises(SourceError) as error:
+        extract_104([])
+    assert error.value.code == "format_changed"
+
+
+def test_browser_search_429_is_not_empty_success():
+    async def check():
+        search=BrowserSearch("104",Settings(_env_file=None,request_delay_seconds=0,request_timeout_seconds=.01))
+        class Response:
+            status=429
+            url="https://www.104.com.tw/jobs/search/api/jobs"
+            headers={"content-type":"application/json","retry-after":"7200"}
+            async def json(self):
+                return {"data":[]}
+        class Locator:
+            async def inner_text(self):
+                return "搜尋職缺"
+        class Page:
+            def on(self,event,handler):
+                self.handler=handler
+            def remove_listener(self,*args):
+                pass
+            async def goto(self,*args,**kwargs):
+                self.handler(Response())
+                return type("MainResponse",(),{"status":200})()
+            async def content(self):
+                await asyncio.sleep(0)
+                return "<h1>搜尋職缺</h1>"
+            async def title(self):
+                return "搜尋"
+            def locator(self,*args):
+                return Locator()
+        search.browser,search.page=object(),Page()
+        with pytest.raises(SourceError) as error:
+            await search.load("https://www.104.com.tw/jobs/search/")
+        assert error.value.code=="rate_limited" and error.value.cooldown_seconds==7200
+    asyncio.run(check())
