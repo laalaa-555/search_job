@@ -17,6 +17,8 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.ingestion.normalize import NormalizedJob
 from app.ingestion.store import upsert_job
+from app.ingestion.http import SourceError
+from app.ingestion.progress import BATCH_SOURCES, checkpoint, prepare_cycle, progress_rows
 from app.models import CollectionRun, SourceState, WorkerLock, utcnow
 
 log = logging.getLogger("jobfinder.worker")
@@ -72,6 +74,10 @@ async def run_source(source, trigger, settings, semaphore):
             state.reason_code, state.next_retry_at = None, None
             state.last_started_at = utcnow()
             state.collected_count, state.keywords_completed, state.keywords_total = 0, 0, len(settings.keywords)
+            if source in BATCH_SOURCES:
+                cycle = prepare_cycle(db, state, settings)
+                state.keywords_completed = sum(row.completed_at is not None for row in progress_rows(db, cycle.id))
+                state.truncated = cycle.truncated
             run = CollectionRun(source=source, trigger=trigger)
             db.add(run)
             db.commit()
@@ -93,9 +99,17 @@ async def run_source(source, trigger, settings, semaphore):
                 async with asyncio.timeout(settings.for_source(source).source_timeout_seconds):
                     while line := await process.stdout.readline():
                         event = json.loads(line.decode("utf-8"))
+                        acknowledgement = None
                         with SessionLocal() as db:
                             state = db.get(SourceState, source)
-                            if event["type"] in ("job", "detail"):
+                            if event["type"] in ("page", "page_failed"):
+                                saved = checkpoint(db, state, event)
+                                seen.update(saved)
+                                state.collected_count = len(seen)
+                                if saved:
+                                    state.last_data_at = utcnow()
+                                acknowledgement = b"page_saved\n"
+                            elif event["type"] in ("job", "detail"):
                                 job = NormalizedJob.model_validate(event["job"])
                                 if job.source != source:
                                     raise ValueError("Source process emitted a different source")
@@ -105,13 +119,16 @@ async def run_source(source, trigger, settings, semaphore):
                                     state.collected_count = len(seen)
                                 state.last_data_at = utcnow()
                             elif event["type"] == "lists_finished":
-                                process.stdin.write(b"lists_saved\n")
-                                await process.stdin.drain()
+                                acknowledgement = b"lists_saved\n"
                             elif event["type"] == "progress":
                                 state.keywords_completed = event["completed"]
                             elif event["type"] == "finished":
                                 finished = event
                             db.commit()
+                        # Never acknowledge before committing the page transaction.
+                        if acknowledgement:
+                            process.stdin.write(acknowledgement)
+                            await process.stdin.drain()
                     code = await process.wait()
                     if code or not finished:
                         raise RuntimeError("來源程序未正常完成")
@@ -124,7 +141,9 @@ async def run_source(source, trigger, settings, semaphore):
             finished = {"status": "interrupted", "error": "收集已中斷，已寫入資料保留"}
             raise
         except Exception as exc:
-            finished = {"status": "partial" if seen else "error", "error": "來源執行逾時" if isinstance(exc, TimeoutError) else str(exc)[:250]}
+            finished = {"status": "partial" if seen else "error", "error": "來源執行逾時" if isinstance(exc, TimeoutError) else str(exc)[:250],
+                        "reason_code": exc.code if isinstance(exc, SourceError) else "source_timeout" if isinstance(exc, TimeoutError) else "source_error",
+                        "cooldown_seconds": getattr(exc, "cooldown_seconds", 0)}
             log.warning("%s failed: %s", source, finished["error"])
         finally:
             if process and process.returncode is None:
@@ -141,10 +160,13 @@ async def run_source(source, trigger, settings, semaphore):
                     state.next_retry_at = utcnow() + timedelta(seconds=cooldown)
                 state.last_finished_at = run.finished_at = utcnow()
                 state.collected_count = run.collected_count = len(seen)
-                state.truncated = (finished or {}).get("truncated", False)
+                state.truncated = (finished or {}).get("truncated", state.truncated)
                 state.keywords_completed = (finished or {}).get("completed", state.keywords_completed)
                 if state.status == "success":
                     state.last_success_at = utcnow()
+                    if source not in BATCH_SOURCES:
+                        state.last_cycle_completed_at = state.last_success_at
+                        state.last_completed_scope_hash = settings.scope_hash(source)
                 db.commit()
         log.info("Finished %s: %s, %d jobs", source, state.status, len(seen))
 

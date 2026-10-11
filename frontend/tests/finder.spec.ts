@@ -100,6 +100,32 @@ test('first collection shows progress in an empty database', async ({page}) => {
   await expect(page.getByText('0 筆 · 關鍵字 0/1')).toBeVisible();
 });
 
+test('batch progress and full cycle completion are distinct', async ({page}) => {
+  await mockedApi(page);
+  let complete = false;
+  await page.route('**/api/v1/sources', route => route.fulfill({json:{items:[{
+    source:'linkedin',label:'LinkedIn',enabled:true,status:complete ? 'success' : 'batch_complete',
+    stored_count:50,collected_count:10,keywords_completed:complete ? 12 : 0,keywords_total:12,
+    cycle_id:3,cycle_completed:complete,cycle_keywords_completed:complete ? 12 : 0,cycle_keywords_total:12,
+    pending_keywords:complete ? 0 : 12,cycle_pages_collected:6,
+    last_cycle_completed_at:complete ? '2026-10-11T00:00:00Z' : null,
+    last_success_at:'2026-10-10T00:00:00Z',last_finished_at:'2026-10-11T00:00:00Z',
+    keyword_progress:[{keyword:'Data Scientist',next_page:2,next_offset:10,collected_count:10,completed:false,truncated:false}],
+    reason_code:null,next_retry_at:null,error:null,truncated:false}],
+    keywords:['Data Scientist'],location:'Taiwan',max_results_per_keyword:100,batch_pages_per_run:6,
+    schedule_timezone:'Asia/Taipei',schedule_hour:6,schedule_minute:0,worker_running:false}}));
+  await page.goto('/');
+  await expect(page.getByText('本次批次完成',{exact:true})).toBeVisible();
+  await expect(page.getByText(/待完成 12/)).toBeVisible();
+  await expect(page.getByText(/整輪更新 尚未成功更新/)).toBeVisible();
+  await page.getByText('查看收集進度',{exact:true}).click();
+  await expect(page.getByText(/待收集第 2 頁/)).toBeVisible();
+  complete = true;
+  await page.reload();
+  await expect(page.getByText('整輪更新完成',{exact:true})).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth)).toBe(false);
+});
+
 test('removing the last bookmark on page two returns to page one', async ({page}) => {
   await mockedApi(page);
   let count = 21;

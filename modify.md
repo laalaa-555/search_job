@@ -87,3 +87,39 @@
 ### 提交後的邊界回歸修正
 
 主要修改 `8deaac8`（改善來源收集與冷卻機制）已推送。補測發現搜尋 XHR 429 空 JSON 列表被誤判成功，以及非物件 JSON 的未分類錯誤；新增兩項測試先重現，再修正 XHR 狀態與頂層型別檢查。重新建置容器並執行兩種 DB 共 41 項測試；瀏覽器既有驗證涵蓋相同前端，後續修改僅涉及收集錯誤分類。來源冷卻期間不重複向外部網站請求。
+
+## 2026-10-11：加入分批接續與週期進度
+
+### 修改
+
+- Migration 0003 新增週期／關鍵字進度表；保存設定範圍、頁碼、LinkedIn offset、已取得 ID、頁面簽章及完成時間。範圍變更或週期完成後，下次執行建立新週期，保留舊職缺與收藏。
+- LinkedIn／Cake 每次六頁列表，輪替關鍵字；預設間隔 30／10 秒。根 .env.example 與本機忽略的 .env 同步，未新增每小時排程。JobSpy 單頁阻止內部第二次 HTTP，跨頁呼叫維持間隔。
+- Worker 的 page／page_failed 協議：整頁職缺與進度同交易，commit 後才回覆 page_saved；失敗頁不前進並將關鍵字輪替到下一組。429 立即停止、保留既有冷卻機制；104 的 429 不再追加瀏覽器備援。
+- LinkedIn 只有整週期列表完成才查詢整週期的詳情候選，七天／20 筆規則保留；列表缺少欄位不清空既有詳情。
+- /sources 增加週期、完成／待完成關鍵字、累計保存頁數、每關鍵字進度及相同範圍的完整週期時間。舊單一關鍵字成功不冒充目前完整更新。前端區分批次與整輪，提供進度展開與限制說明。
+- 104／1111 BrowserSearch 加入有上限且去敏的請求診斷，保存在忽略的 data/diagnostics 掛載目錄；記錄路徑／狀態碼／資源类型與錯誤數，不記錄 Cookie、headers、query、全文或 console 內容。probe_recovery 先檢查 DB API 冷卻，讀不到 API 即停止。
+- 更新 README、Architecture、AGENTS、lesson。實際錯誤：upsert helper 提前 commit 導致整頁回滾不完整，已增加 commit=False 並保留回歸測試。
+
+### 驗證
+
+| 項目 | 結果 |
+|---|---|
+| SQLite／PostgreSQL | 各 61 項通過，測試只使用暫存 SQLite／test_jobs；含輪替、進度接續、交易回滾、commit 後確認、429 保留失敗頁、冷卻不重置進度、重複頁、上限、設定變更、先整輪列表後詳情及診斷去敏 |
+| Migration | SQLite 0001→0002→0003 保留職缺／收藏／冷卻，且不補造舊完整週期時間；正式 PostgreSQL 備份後升級，Alembic check 無差異 |
+| 前端 | TypeScript／Vite build 通過；桌面／手機 18 項 E2E 通過，新增批次與整輪狀態区别案例 |
+| Compose | 三次啟動依既有週期接續；104／1111 均冷卻跳過。API／DB healthy、仅本機連接埠；每日 06:00 保留，沒有每小時排程 |
+| 真實重啟 | 1369 筆真實職缺、暫存收藏、週期／頁碼／offset／ID、完整時間與冷卻期限在 DB／API／前端重啟後保留；收藏恢復原狀，Worker 已恢復 |
+| 真實 UI | WorldQuant 搜尋三筆，桌面與 390×844 手機來源狀態／進度可見；搜尋只讀 DB，既有 DB-only 網路禁止測試亦通過 |
+| 備份 | 升級前 data/backups/jobs-20261011-230023.dump，未刪除持久化 volume |
+
+### 真實來源結果及未完成驗收
+
+- **Cake：分批與第二頁接續成功，整輪未完成。** 首批／次批／第三批保存 23／36／25 筆不同職缺，累計 18 頁；前六個關鍵字等待第 3 頁，後六個等待第 2 頁。既有總資料 282 筆、沒有增加重複職缺，這三批均無 429。
+- **LinkedIn：跨批次接續成功，限流仍未解除。** 前兩批保存 46／58 筆不同職缺，12 個關鍵字均取得第一頁，週期內去重後 104 筆、資料庫共 140 筆。第三批 Data Scientist 的第二頁／offset 10 返回 429；未提交失敗頁，12 頁進度保留、冷卻到台北時間 10/12 00:11。整輪、第二頁實際資料及新詳情階段的真實 HTTP 尚未完成驗收；fixture 成功不替代。
+- **Indeed：正常更新。** 最新本輪保存 810 筆、資料庫 1005 筆，其他來源失敗不影響它。
+- **104：仍未完成。** 舊 Windows／Compose 實測為 403／verification_required；冷卻到 10/12 21:48。新版 Worker 與 Windows probe 均跳過，不降低冷卻或反覆请求。待期滿後核對正常 Windows 瀏覽器／Docker 的搜尋 JSON 與腳本請求；真實職缺、欄位、分頁仍待驗證。
+- **1111：仍未完成。** 舊 Windows／Compose 實測 Loading／loading_timeout，冷卻同至 10/12 21:48；新版診斷未向該站發出請求。空白頁原因目前不能確定，需期滿後以腳本／搜尋請求證據判斷；真實卡片及分頁仍待取得。
+
+抽查這三個可取得來源各五筆已收集的真實列表資料之職稱、公司、網址與原始薪資：LinkedIn 的 Yahoo／DBS／KKCompany／TrendAI／MaiCoin 列表均未提供薪資；Cake 样本含 TWD 月薪 5–10 萬及年薪 100–200 萬；Indeed 樣本含月薪 5–9 萬與 5.5 萬。此為本轮收集結果抽查，沒有在冷卻期间另抓 LinkedIn 詳情。
+
+忽略目錄的證據：data/diagnostics/batch-first-sources.json、batch-final-sources.json、real-job-audit.json、data/verification.json；舊 104／1111 Windows 診斷仍保留。最後快照共有 1427 筆真實職缺。**五站完整接入仍未達成；104／1111 的新版 Windows／Docker 比較、LinkedIn 整輪／詳情、Cake 新週期完整更新及每日 06:00 真實牆鐘執行仍待驗收。**

@@ -5,8 +5,8 @@
 ## 任務流程
 
 1. 初始化設定與資料庫 migration。
-2. Worker 啟動立即收集指定關鍵字的職缺，逐筆清理、去重、保存。
-3. 保持開機時依台北時間每日 06:00 更新；關機後下次啟動重新收集。
+2. Worker 啟動立即收集指定關鍵字；LinkedIn、Cake 依資料庫進度分批接續，整頁職缺與進度一起保存。
+3. 保持開機時依台北時間每日 06:00 更新；關機後下次啟動接續，沒有每小時排程。
 4. 前端經 API 搜尋已收集的資料；收藏存在本機資料庫。
 5. 顯示各來源進度、最後成功時間、失敗原因與涵蓋範圍。
 
@@ -53,19 +53,22 @@ PostgreSQL 使用持久化 volume；`down`、容器重建與 Worker 重啟保留
 | `COLLECT_ON_STARTUP` | 啟動時立即收集，預設 `true` |
 | `SCHEDULE_TIMEZONE/HOUR/MINUTE` | 每日更新時間，預設 `Asia/Taipei` 06:00 |
 | `MAX_RESULTS_PER_KEYWORD` | 每來源／關鍵字上限，預設 100 |
-| `MAX_PAGES_PER_KEYWORD` | HTTP 連接器分頁上限，預設 10；JobSpy 由結果筆數限制 |
+| `MAX_PAGES_PER_KEYWORD` | 每關鍵字分頁上限，預設 10；LinkedIn 亦遵循此上限，Indeed 由 JobSpy 結果筆數限制 |
+| `BATCH_PAGES_PER_RUN` | LinkedIn、Cake 每次最多取得列表頁數，預設 6；輪替所有未完成關鍵字 |
 | `REQUEST_DELAY_SECONDS` | 外部請求間隔，預設 2 秒 |
 | `REQUEST_TIMEOUT_SECONDS/RETRIES` | 請求逾時及有限重試；JobSpy 遵循請求逾時並回報失敗 |
 | `SOURCE_TIMEOUT_SECONDS` | 每來源執行上限，預設 1800 秒；逾時保留已寫入資料 |
 | `WORKER_LOCK_SECONDS` | 資料庫租約期限，預設 120 秒，執行中定期續租 |
 | `STATUS_STALE_DAYS` | 最後收集超過此天數顯示資料較舊，預設 7 天 |
-| `SOURCE_REQUEST_DELAYS` | JSON 物件，指定來源請求間隔；預設 `{"linkedin":10}`，其他來源使用全域間隔 |
+| `SOURCE_REQUEST_DELAYS` | JSON 物件，指定來源請求間隔；預設 `{"linkedin":30,"cake":10}`，其他來源使用全域間隔 |
 | `SOURCE_REQUEST_TIMEOUTS` | JSON 物件，指定來源請求逾時；預設 `{}`，使用全域逾時 |
 | `SOURCE_TIMEOUTS` | JSON 物件，指定來源整輪執行上限；預設 `{"linkedin":3600}` |
 | `LINKEDIN_DETAIL_LIMIT` | 列表完成後每輪詳情上限，預設 20；0 停用詳情收集 |
 | `LINKEDIN_DETAIL_REFRESH_DAYS` | 成功取得詳情後多久可重抓，預設 7 天 |
 | `RATE_LIMIT_COOLDOWN_SECONDS` | 429 冷卻至少一小時，採用此值與 `Retry-After` 的較大值 |
 | `BLOCKED_COOLDOWN_SECONDS` | 403／452／驗證頁及載入受阻冷卻，預設一天 |
+| `SOURCE_DIAGNOSTICS` | 保存 104／1111 瀏覽器請求診斷，預設 true |
+| `DIAGNOSTICS_DIRECTORY/MAX_EVENTS` | 診斷目錄與每頁請求紀錄上限，預設 data/diagnostics、100；Compose Worker 掛載到本機忽略目錄 |
 | `CORS_ORIGINS` | 原生前端開發允許的來源 |
 | `VITE_API_BASE_URL` | Vite 開發時的公開 API 路徑，預設 `/api/v1` |
 
@@ -83,18 +86,30 @@ Docker 前端使用同源 `/api/v1` 與 Nginx 代理。API 來源憑證、資料
 - LinkedIn 先收集列表，再補充有限筆數的詳情；尚未取得時顯示「詳情尚未取得」。列表缺少薪資、描述或技能不清空既有詳情。
 - 冷卻期限保存於資料庫，重啟不會解除。期限過後，在下次 Worker 啟動或每日排程才再次嘗試，沒有額外的每小時重試排程。
 
+## 分批收集與完整更新
+
+LinkedIn、Cake 每次最多六頁列表，先讓不同關鍵字各取得一頁，再輪流處理下一頁。資料庫保存週期、關鍵字、頁碼／offset、已取得 ID 與頁面簽章；只有頁面資料及進度一起 commit 後，子程序才繼續。中斷後重抓未提交頁面；失敗頁不前進，但下次先讓其他關鍵字嘗試。429 立即停止來源並保存冷卻，不使用瀏覽器追加請求。
+
+「本次批次完成」表示執行額度內的頁面成功，仍可能有待完成關鍵字；「整輪更新完成」才表示目前設定的所有關鍵字均到達來源結果末端或設定上限。上限仍會明確標示，並不代表來源全部職缺。最後整輪時間只適用於相同收集範圍，旧單一關鍵字測試時間不當作完整更新。
+
+整輪完成後，下次啟動或每日排程建立新週期。修改關鍵字、地區、筆數／頁數上限也建立新週期，保留舊職缺與收藏；調整間隔或批次額度不會清除進度。完整更新可能需要數日或數週。來源排序會變動，去重可避免重複，但不能保證取得同一時刻完整的前 100 筆。
+
+LinkedIn 詳情候選改為整個週期已取得的職缺；只有所有列表關鍵字完成才啟動詳情階段，七天／每次 20 筆規則不變。
+
 ## 資料來源與實測狀態
 
 五個來源都有獨立連接器。外部網站會改版、限制請求或要求驗證；程式清楚回報失敗，既有資料仍可查詢。
 
-2026-10-11 修正後已重新實測 Windows 與 Compose：104 仍回傳 403／安全驗證，1111 在正常等待後仍停在空白 Loading 頁。LinkedIn 小批量 5 筆成功，預設範圍第二次列表請求仍回傳 429，保存本輪 10 筆並進入一小時冷卻。Cake 曾完成全關鍵字更新，本次恢復 Worker 後也收到 429；Indeed 本次全關鍵字成功。五站全部成功的最終驗收仍未達成，詳見 `modify.md`。
+2026-10-11 新版 Compose 首批：LinkedIn 六頁保存 46 筆不同列表職缺，Cake 六頁保存 23 筆。重啟成功接續後六個關鍵字；再測第二頁時，Cake 累計保存 18 頁，LinkedIn 第二頁收到 429、保留原 12 頁進度並冷卻。兩站整輪尚未完成。104、1111 的舊存取問題尚未解除，仍在冷卻中，本輪沒有重新請求這兩站。五站全部成功的最終驗收仍未達成，詳見 `modify.md`。
 
 - 104：先建立一般 HTTP Session，再讀取網站內部 JSON；失敗時以普通 Playwright 讀取搜尋頁實際取得的 JSON 或職缺卡片。參考 [tw-job-scraper](https://github.com/kengkeng44/tw-job-scraper)，沒有使用官方開發者授權 API。
 - LinkedIn、Indeed：[JobSpy](https://github.com/speedyapply/JobSpy)；捕捉 requests／curl HTTP 狀態及 `Retry-After`，不把失敗當空結果。LinkedIn 關閉 JobSpy 的逐筆詳情；所有列表關鍵字完成並確認寫入後，優先補充本輪看見、尚未取得或超過七天的詳情。完整列表仍可能限流。
 - Cake：解析真正關鍵字路徑的 Next.js 搜尋資料，按 pageMap 取當頁結果，排除其他來源的轉載。
 - 1111：一般 Chromium 載入公開搜尋頁，解析 JSON-LD 或可辨識卡片。判斷驗證頁使用實際可見文字，避免把隱藏錯誤訊息誤判成需要人工驗證；載入逾時與結構改版分開回報。目前無法取得真實卡片，因此新版欄位與分頁仍待實測。
 
-`scripts/inspect_sources.py`、`probe_cake.py`、`probe_browser.py`、`probe_recovery.py` 是隔離的來源診斷工具，不寫入正式職缺。診斷輸出與原始頁面保存於忽略目錄，勿提交到 Git。正式收集使用 Worker，遵守租約與資料庫冷卻；不要反覆執行診斷工具測試受阻來源。
+`scripts/probe_recovery.py` 是隔離診斷工具，不寫入正式職缺；先讀本機 `/sources` 的冷卻，API 無法讀取時也不請求來源。舊 `inspect_sources.py`、`probe_cake.py`、`probe_browser.py` 為開發探查工具，不負責租約或冷卻，不能用來繞過限制。正式收集請使用 Worker。
+
+104／1111 的 BrowserSearch 自動記錄主文件、搜尋／腳本狀態碼、重新導向、失敗請求與可見頁面分類，供冷卻期滿後比較 Windows 一般瀏覽器與 Docker Chromium。檔案不記錄 Cookie、headers、查詢字串、頁面全文或 console 內容，僅記錄錯誤數量；位於 `data/diagnostics`，不提交 Git。判斷腳本失敗仍須實際診斷證據，不能從空白 Loading 頁直接推定原因。
 
 ## 本機開發與 SQLite
 
@@ -145,7 +160,7 @@ E2E 預設測試 Compose 的 `http://127.0.0.1:3000`，使用隔離的 API 測�
 
 PostgreSQL 測試只能指定名稱以 `test_` 開頭的獨立資料庫；測試會建立與清除該資料庫中的測試表。執行 `docker compose exec -T api python test_postgres.py` 可在 Compose 內建立 `test_jobs`，執行與 SQLite 相同的測試。測試程序的預設應用資料庫另設為空白記憶體 DB，讓誤用正式 Session factory 的測試立即失敗。CI 也執行兩種資料庫測試。
 
-本次已通過 SQLite 41 項、PostgreSQL 41 項、桌面／手機 E2E 16 項與 Compose 建置。包含 SQLite 舊版 migration 升級保留資料與收藏。真實資料的容器重啟驗證可在根目錄執行：
+本次 SQLite／PostgreSQL 各 61 項、桌面／手機 E2E 18 項與 Compose 建置通過；包含舊版 migration 升級保留資料／收藏／冷卻、頁面回滾與跨批次接續。真實資料的容器重啟驗證可在根目錄執行：
 
 ```powershell
 .\.venv\Scripts\python.exe scripts/verify_local.py
@@ -153,7 +168,7 @@ PostgreSQL 測試只能指定名稱以 `test_` 開頭的獨立資料庫；測試
 docker compose up -d
 ```
 
-此檢查使用既有真實職缺，暫存一筆收藏；重啟資料庫、API、前端後檢查並恢復原收藏狀態，不插入示範職缺。
+此檢查使用既有真實職缺，暫存一筆收藏；重啟資料庫、API、前端後核對職缺、收藏、分頁進度與冷卻期限並恢復原收藏狀態，不插入示範職缺。
 
 ## 備份與還原
 

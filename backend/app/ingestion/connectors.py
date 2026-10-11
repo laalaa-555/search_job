@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime
 import json
 import logging
@@ -22,6 +23,14 @@ class Connector:
 
     async def close(self):
         await self.http.close()
+
+
+@dataclass
+class SearchPage:
+    jobs: list[NormalizedJob]
+    raw_ids: list[str]
+    has_more: bool
+    next_offset: int = 0
 
 
 def extract_104(payload):
@@ -74,7 +83,11 @@ class Source104(Connector):
                         self.session_loaded = True
                     response = await self.http.get("https://www.104.com.tw/jobs/search/api/jobs", params=params, headers={"Referer": search_url, "Accept": "application/json, text/plain, */*"})
                     rows = [parse_104(item) for item in extract_104(response.json())]
-                except (SourceError, ValueError):
+                except SourceError as exc:
+                    if exc.code == "rate_limited":
+                        raise
+                    self.browser_mode = True
+                except ValueError:
                     # One ordinary browser context per round, reused only if it works.
                     self.browser_mode = True
             if self.browser_mode:
@@ -142,6 +155,21 @@ def parse_cake(item):
 
 
 class Cake(Connector):
+    async def collect_page(self, keyword, page, offset=0):
+        params = {"locale": "zh-TW", "page": page}
+        url = f"https://www.cake.me/jobs/{quote(keyword, safe='')}?{urlencode(params)}"
+        response = await self.http.get(url, headers={"Referer": url, "Accept": "application/json,text/html"})
+        rows, total_pages = extract_cake(response.text, page, include_pagination=True)
+        # Include transferred/overseas IDs in the signature: an excluded page is not zero results.
+        state = json.loads(BeautifulSoup(response.text, "html.parser").find("script", id="__NEXT_DATA__").get_text())["props"]["pageProps"]["initialState"]
+        state = json.loads(state) if isinstance(state, str) else state
+        search = state["jobSearch"]
+        view = search["viewsByFilterKey"][search["activeFilterKey"]]
+        raw_ids = view.get("pageMap", {}).get(str(page), view.get("pageMap", {}).get(page, []))
+        jobs = [parse_cake(item) for item in rows if self.settings.collect_location.lower() not in ("taiwan", "台灣", "全台")
+                or re.search(r"台灣|臺灣|Taiwan", " ".join(item.get("locations", [])), re.I)]
+        return SearchPage(jobs, [str(value) for value in raw_ids], page < total_pages)
+
     async def collect(self, keyword):
         seen = set()
         for page in range(1, self.settings.max_pages_per_keyword + 1):
@@ -227,35 +255,45 @@ class JobSpyConnector(Connector):
         super().__init__(settings)
         self.source = source
         self.last_error = None
+        self.next_request = 0.0
+        self.raw_ids = []
 
-    def scrape(self, keyword):
+    def scrape(self, keyword, offset=0, single_page=False):
         from jobspy import scrape_jobs
         from jobspy.util import RequestsRotating, TLSRotating
         capture = ErrorCapture()
         logger = logging.getLogger(f"JobSpy:{'LinkedIn' if self.source == 'linkedin' else 'Indeed'}")
         logger.addHandler(capture)
         originals = {RequestsRotating: RequestsRotating.request, TLSRotating: TLSRotating.request}
-        next_request = 0.0
+        requests = 0
+        self.raw_ids = []
         self.last_error = None
 
         def paced(session, method, url, **kwargs):
-            nonlocal next_request
+            nonlocal requests
             if self.last_error or any(re.search(r"status code (?:403|429)\b", message) for message in capture.messages):
                 raise SourceError("本次來源已拒絕請求，停止後續網路存取")
-            time.sleep(max(0, next_request - time.monotonic()))
+            if single_page and requests:
+                raise SourceError("JobSpy 嘗試超出單頁請求額度", "format_changed")
+            requests += 1
+            time.sleep(max(0, self.next_request - time.monotonic()))
             kwargs.setdefault("timeout", self.settings.request_timeout_seconds)
             try:
                 response = originals[type(session)](session, method, url, **kwargs)
                 if response.status_code in (401, 403, 429, 452):
                     self.last_error = response_error(response.status_code, self.settings, response.headers.get("Retry-After"))
+                elif single_page and response.status_code == 200:
+                    cards = BeautifulSoup(response.text, "html.parser").select(".base-search-card")
+                    self.raw_ids = [card.get("data-entity-urn", "").split(":")[-1] for card in cards]
                 return response
             finally:
-                next_request = time.monotonic() + self.settings.request_delay_seconds
+                self.next_request = time.monotonic() + self.settings.request_delay_seconds
 
         RequestsRotating.request = paced
         TLSRotating.request = paced
         try:
-            frame = scrape_jobs(site_name=[self.source], search_term=keyword, location=self.settings.collect_location, country_indeed="Taiwan", results_wanted=self.settings.max_results_per_keyword, enforce_annual_salary=False, description_format="plain", fetch_description=False, verbose=1)
+            from jobspy.linkedin.constant import jobs_per_page
+            frame = scrape_jobs(site_name=[self.source], search_term=keyword, location=self.settings.collect_location, country_indeed="Taiwan", results_wanted=jobs_per_page if single_page else self.settings.max_results_per_keyword, offset=offset, enforce_annual_salary=False, description_format="plain", fetch_description=False, verbose=1)
             # Replace Pandas NaN/NaT without leaking non-finite values into JSON.
             records = json.loads(frame.to_json(orient="records", date_format="iso"))
         finally:
@@ -264,10 +302,25 @@ class JobSpyConnector(Connector):
             logger.removeHandler(capture)
         return records, capture.messages
 
-    async def collect(self, keyword):
-        records, errors = await asyncio.to_thread(self.scrape, keyword)
-        if len(records) >= self.settings.max_results_per_keyword:
-            self.truncated = True
+    def check_errors(self, errors):
+        if self.last_error:
+            raise self.last_error
+        if errors:
+            statuses = [match.group(1) for message in errors if (match := re.search(r"status code (\d+)", message))]
+            if any(status in ("403", "429", "452", "401") for status in statuses):
+                raise response_error(int(next(status for status in statuses if status in ("403", "429", "452", "401"))), self.settings)
+            raise SourceError("JobSpy 來源請求失敗" + (f"（HTTP {','.join(dict.fromkeys(statuses))}）" if statuses else "，未將空結果視為成功"))
+
+    async def collect_page(self, keyword, page, offset=0):
+        from jobspy.linkedin.constant import jobs_per_page
+        records, errors = await asyncio.to_thread(self.scrape, keyword, offset, True)
+        # A failed page is never committed as a successful checkpoint.
+        self.check_errors(errors)
+        if self.raw_ids and (any(not value for value in self.raw_ids) or len(records) != min(len(set(self.raw_ids)), jobs_per_page)):
+            raise SourceError("LinkedIn 卡片未完整解析，保留原分頁進度", "format_changed")
+        return SearchPage(list(self.normalize_records(records)), self.raw_ids, len(self.raw_ids) >= jobs_per_page, offset + jobs_per_page)
+
+    def normalize_records(self, records):
         for row in records:
             low, high = number(row.get("min_amount")), number(row.get("max_amount"))
             period = {"monthly": "month", "yearly": "year", "hourly": "hour", "daily": "day", "weekly": "week"}.get(row.get("interval"))
@@ -279,13 +332,14 @@ class JobSpyConnector(Connector):
                 text = f"{row.get('currency') or ''} {amount} / {row.get('interval') or '週期未提供'}"
             posted = row.get("date_posted")
             yield NormalizedJob(source=self.source, external_id=str(row.get("id") or ""), title=row.get("title") or "", company=row.get("company") or "", location=row.get("location") or "", url=row.get("job_url") or "", description=row.get("description") or "", salary_text=text, salary_currency=row.get("currency"), salary_period=period, salary_min=low, salary_max=high, source_updated_at=datetime.fromisoformat(posted.replace("Z", "+00:00")) if posted else None, update_mode="listing" if self.source == "linkedin" else "full", detail_status="pending" if self.source == "linkedin" else "complete")
-        if self.last_error:
-            raise self.last_error
-        if errors:
-            statuses = [match.group(1) for message in errors if (match := re.search(r"status code (\d+)", message))]
-            if any(status in ("403", "429", "452", "401") for status in statuses):
-                raise response_error(int(next(status for status in statuses if status in ("403", "429", "452", "401"))), self.settings)
-            raise SourceError("JobSpy 來源請求失敗" + (f"（HTTP {','.join(dict.fromkeys(statuses))}）" if statuses else "，未將空結果視為成功"))
+
+    async def collect(self, keyword):
+        records, errors = await asyncio.to_thread(self.scrape, keyword)
+        if len(records) >= self.settings.max_results_per_keyword:
+            self.truncated = True
+        for job in self.normalize_records(records):
+            yield job
+        self.check_errors(errors)
 
 
 def make_connector(source, settings):

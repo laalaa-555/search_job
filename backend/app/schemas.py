@@ -43,6 +43,15 @@ class JobPage(BaseModel):
     page_size: int
 
 
+class KeywordProgressOut(BaseModel):
+    keyword: str
+    next_page: int
+    next_offset: int
+    collected_count: int
+    completed: bool
+    truncated: bool
+
+
 class SourceOut(BaseModel):
     source: str
     label: str
@@ -60,6 +69,15 @@ class SourceOut(BaseModel):
     reason_code: str | None = None
     next_retry_at: datetime | None = None
     last_data_at: datetime | None = None
+    cycle_id: int | None = None
+    cycle_started_at: datetime | None = None
+    cycle_completed: bool = False
+    cycle_keywords_completed: int = 0
+    cycle_keywords_total: int = 0
+    pending_keywords: int = 0
+    cycle_pages_collected: int = 0
+    last_cycle_completed_at: datetime | None = None
+    keyword_progress: list[KeywordProgressOut] = []
 
 
 class SourcesOut(BaseModel):
@@ -71,3 +89,4 @@ class SourcesOut(BaseModel):
     schedule_hour: int
     schedule_minute: int
     worker_running: bool
+    batch_pages_per_run: int

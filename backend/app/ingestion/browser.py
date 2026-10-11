@@ -3,6 +3,8 @@ import asyncio
 import json
 import re
 import time
+from pathlib import Path
+import uuid
 from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
@@ -12,6 +14,14 @@ from app.ingestion.normalize import NormalizedJob, parse_salary
 
 EMPTY = re.compile(r"沒有符合.{0,30}(?:職缺|工作)|查無.{0,20}(?:職缺|工作)|找不到.{0,20}(?:職缺|工作)|共\s*0\s*(?:筆|個).{0,15}(?:職缺|工作)")
 CHALLENGE = re.compile(r"verify you are human|checking your browser|just a moment|captcha|安全驗證|人機驗證|確認您是真人", re.I)
+
+
+def diagnostic_url(value):
+    parts = urlsplit(value)
+    if parts.scheme not in ("https", "http"):
+        return f"{parts.scheme}:[inline]"
+    path = "/".join(part if len(part) <= 80 and "@" not in part else "[redacted]" for part in parts.path.split("/"))
+    return f"{parts.scheme}://{parts.hostname or ''}{path}"
 
 
 def page_error(body, settings, visible_text=None):
@@ -92,6 +102,7 @@ class BrowserSearch:
         self.source, self.settings = source, settings
         self.playwright = self.browser = self.page = None
         self.next_request = 0.0
+        self.diagnostics = {}
 
     async def load(self, url):
         from playwright.async_api import async_playwright, TimeoutError as BrowserTimeout
@@ -101,6 +112,20 @@ class BrowserSearch:
             self.page = await self.browser.new_page(locale="zh-TW")
         await asyncio.sleep(max(0, self.next_request - time.monotonic()))
         captured, errors, tasks = [], [], set()
+        events = []
+        self.diagnostics = {"source": self.source, "runtime": "Chromium", "requests": events, "console_errors": 0, "page_errors": 0}
+        def record_response(response):
+            if len(events) < self.settings.diagnostics_max_events:
+                request = getattr(response, "request", None)
+                events.append({"url": diagnostic_url(response.url), "status": response.status, "type": getattr(request, "resource_type", "unknown")})
+        def record_failure(request):
+            if len(events) < self.settings.diagnostics_max_events:
+                events.append({"url": diagnostic_url(request.url), "status": None, "type": request.resource_type, "failed": True})
+        def record_console(message):
+            if message.type == "error":
+                self.diagnostics["console_errors"] += 1
+        def record_page_error(_):
+            self.diagnostics["page_errors"] += 1
         async def capture(response):
             host = urlsplit(response.url).hostname or ""
             if self.source == "104" and (host == "104.com.tw" or host.endswith(".104.com.tw")) and "search" in response.url and ("api" in response.url or "json" in response.headers.get("content-type", "")):
@@ -114,10 +139,14 @@ class BrowserSearch:
                 except (ValueError, SourceError):
                     pass
         def on_response(response):
+            record_response(response)
             task = asyncio.create_task(capture(response))
             tasks.add(task)
             task.add_done_callback(tasks.discard)
         self.page.on("response", on_response)
+        self.page.on("requestfailed", record_failure)
+        self.page.on("console", record_console)
+        self.page.on("pageerror", record_page_error)
         try:
             response = await self.page.goto(url, wait_until="domcontentloaded", timeout=int(self.settings.request_timeout_seconds * 1000))
             if response and response.status in (401, 403, 429, 452):
@@ -145,11 +174,26 @@ class BrowserSearch:
             raise SourceError("來源瀏覽器載入逾時", "loading_timeout", self.settings.blocked_cooldown_seconds) from None
         finally:
             self.page.remove_listener("response", on_response)
+            self.page.remove_listener("requestfailed", record_failure)
+            self.page.remove_listener("console", record_console)
+            self.page.remove_listener("pageerror", record_page_error)
             for task in list(tasks):
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             self.next_request = time.monotonic() + self.settings.request_delay_seconds
+            if self.settings.source_diagnostics:
+                try:
+                    visible = (await self.page.title() + " " + await self.page.locator("body").inner_text()).strip()
+                    self.diagnostics["visible_state"] = "verification" if CHALLENGE.search(visible) else "loading" if not visible or visible.lower() in ("loading", "loading...") else "content"
+                    self.diagnostics["final_url"] = diagnostic_url(self.page.url) if isinstance(getattr(self.page, "url", None), str) else diagnostic_url(url)
+                    self.diagnostics["failed_scripts"] = sum(event["type"] == "script" and (event.get("failed") or (event["status"] or 0) >= 400) for event in events)
+                    directory = Path(self.settings.diagnostics_directory)
+                    directory.mkdir(parents=True, exist_ok=True)
+                    (directory / f"browser-{self.source}-{uuid.uuid4().hex}.json").write_text(json.dumps(self.diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception:
+                    # Diagnostics must never replace the actual source failure.
+                    pass
 
     async def close(self):
         if self.browser:

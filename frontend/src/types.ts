@@ -14,8 +14,13 @@ export interface Source {
   last_success_at: string | null; last_finished_at: string | null; collected_count: number; stored_count: number;
   keywords_completed: number; keywords_total: number; error: string | null; truncated: boolean;
   reason_code: string | null; next_retry_at: string | null; last_data_at: string | null;
+  cycle_id: number | null; cycle_started_at: string | null; cycle_completed: boolean;
+  cycle_keywords_completed: number; cycle_keywords_total: number; pending_keywords: number;
+  cycle_pages_collected: number; last_cycle_completed_at: string | null;
+  keyword_progress: {keyword:string; next_page:number; next_offset:number; collected_count:number; completed:boolean; truncated:boolean}[];
 }
 export interface SourceReport {
   items: Source[]; keywords: string[]; location: string; max_results_per_keyword: number;
   schedule_timezone: string; schedule_hour: number; schedule_minute: number; worker_running: boolean;
+  batch_pages_per_run: number;
 }

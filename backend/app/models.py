@@ -68,6 +68,36 @@ class SourceState(Base):
     reason_code: Mapped[str | None] = mapped_column(String(40), nullable=True)
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_data_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    current_cycle_id: Mapped[int | None] = mapped_column(ForeignKey("collection_cycles.id"), nullable=True)
+    last_cycle_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_completed_scope_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class CollectionCycle(Base):
+    __tablename__ = "collection_cycles"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source: Mapped[str] = mapped_column(String(20), index=True)
+    scope_hash: Mapped[str] = mapped_column(String(64))
+    scope: Mapped[dict] = mapped_column(JSON)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_keyword_index: Mapped[int] = mapped_column(Integer, default=0)
+    truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class KeywordProgress(Base):
+    __tablename__ = "keyword_progress"
+    __table_args__ = (UniqueConstraint("cycle_id", "keyword_index", name="uq_cycle_keyword"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cycle_id: Mapped[int] = mapped_column(ForeignKey("collection_cycles.id"), index=True)
+    keyword_index: Mapped[int] = mapped_column(Integer)
+    keyword: Mapped[str] = mapped_column(String(500))
+    next_page: Mapped[int] = mapped_column(Integer, default=1)
+    next_offset: Mapped[int] = mapped_column(Integer, default=0)
+    seen_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    page_signatures: Mapped[list[str]] = mapped_column(JSON, default=list)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    truncated: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class CollectionRun(Base):

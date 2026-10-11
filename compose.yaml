@@ -52,6 +52,8 @@ services:
     command: [python, -m, app.worker]
     restart: unless-stopped
     init: true
+    volumes:
+      - ./data/diagnostics:/app/data/diagnostics
     stop_grace_period: 30s
     depends_on:
       migrate:

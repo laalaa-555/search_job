@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.config import SOURCES, get_settings, split_csv
 from app.db import get_db
 from app.locations import CITY_ALIASES
-from app.models import Bookmark, Job, SourceState, WorkerLock, utcnow
+from app.models import Bookmark, CollectionCycle, Job, KeywordProgress, SourceState, WorkerLock, utcnow
 from app.schemas import JobDetail, JobOut, JobPage, SourceOut, SourcesOut
 
 settings = get_settings()
@@ -108,6 +108,22 @@ def sources_status(db: Db):
     for source, label in SOURCES.items():
         state = states.get(source)
         values = {key: getattr(state, key) for key in SourceOut.model_fields if state and hasattr(state, key)}
+        scope_matches = bool(state and state.last_completed_scope_hash == settings.scope_hash(source))
+        if not scope_matches:
+            values["last_cycle_completed_at"] = None
+        cycle = db.get(CollectionCycle, state.current_cycle_id) if state and state.current_cycle_id else None
+        if cycle and cycle.scope_hash == settings.scope_hash(source):
+            rows = list(db.scalars(select(KeywordProgress).where(KeywordProgress.cycle_id == cycle.id).order_by(KeywordProgress.keyword_index)))
+            completed = sum(row.completed_at is not None for row in rows)
+            values.update(cycle_id=cycle.id, cycle_started_at=cycle.started_at, cycle_completed=cycle.completed_at is not None,
+                          cycle_keywords_completed=completed, cycle_keywords_total=len(rows), pending_keywords=len(rows)-completed,
+                          cycle_pages_collected=sum(row.next_page-1 for row in rows),
+                          keyword_progress=[dict(keyword=row.keyword, next_page=row.next_page, next_offset=row.next_offset,
+                                                 collected_count=len(row.seen_ids), completed=row.completed_at is not None, truncated=row.truncated) for row in rows])
+        else:
+            values.update(cycle_keywords_total=len(settings.keywords), pending_keywords=len(settings.keywords), cycle_completed=scope_matches)
+            if scope_matches:
+                values.update(cycle_keywords_completed=len(settings.keywords), pending_keywords=0)
         enabled = source in settings.sources
         status = values.pop("status", "idle")
         if not enabled:
@@ -116,7 +132,7 @@ def sources_status(db: Db):
             status = "interrupted"
         values.pop("source", None)
         items.append(SourceOut(source=source, label=label, enabled=enabled, status=status, stored_count=counts.get(source, 0), **values))
-    return SourcesOut(items=items, keywords=settings.keywords, location=settings.collect_location, max_results_per_keyword=settings.max_results_per_keyword, schedule_timezone=settings.schedule_timezone, schedule_hour=settings.schedule_hour, schedule_minute=settings.schedule_minute, worker_running=running)
+    return SourcesOut(items=items, keywords=settings.keywords, location=settings.collect_location, max_results_per_keyword=settings.max_results_per_keyword, schedule_timezone=settings.schedule_timezone, schedule_hour=settings.schedule_hour, schedule_minute=settings.schedule_minute, worker_running=running, batch_pages_per_run=settings.batch_pages_per_run)
 
 
 @app.get("/api/v1/health")

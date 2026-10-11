@@ -6,7 +6,7 @@ from app.ingestion.normalize import NormalizedJob
 from app.models import Job, utcnow
 
 
-def upsert_job(db: Session, incoming: NormalizedJob) -> Job:
+def upsert_job(db: Session, incoming: NormalizedJob, *, commit: bool = True) -> Job:
     job = db.scalar(select(Job).where(Job.source == incoming.source, Job.external_id == incoming.external_id))
     if job is None and incoming.source == "104":
         # DOM URLs use a short slug while JSON can carry a numeric jobNo.
@@ -40,5 +40,8 @@ def upsert_job(db: Session, incoming: NormalizedJob) -> Job:
         job.detail_collected_at = values["detail_collected_at"]
         if incoming.update_mode != "details":
             job.last_seen_at = now
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     return job

@@ -22,10 +22,16 @@ def request(path, method="GET"):
         return json.loads(body) if body else None
 
 
+def progress_snapshot():
+    keys = ("cycle_id", "cycle_pages_collected", "cycle_keywords_completed", "pending_keywords", "keyword_progress", "next_retry_at", "last_cycle_completed_at")
+    return {item["source"]:{key:item.get(key) for key in keys} for item in request("/sources")["items"]}
+
+
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
     subprocess.run(["docker", "compose", "stop", "worker"], cwd=ROOT, check=True)
     before = request("/jobs")
+    progress_before = progress_snapshot()
     if not before["items"]:
         raise SystemExit("先收集至少一筆真實職缺再執行")
     job = before["items"][0]
@@ -45,7 +51,8 @@ if __name__ == "__main__":
         after = request("/jobs")
         assert before["total"] == after["total"], "職缺筆數未保留"
         assert request(f"/jobs/{job['id']}")["bookmarked"], "收藏未保留"
-        report = {"job_count": after["total"], "bookmarked_job_id": job["id"], "restart_persistence": "passed"}
+        assert progress_snapshot() == progress_before, "收集進度或冷卻期限未保留"
+        report = {"job_count": after["total"], "bookmarked_job_id": job["id"], "restart_persistence": "passed", "progress_and_cooldown_persistence":"passed"}
         (ROOT / "data").mkdir(exist_ok=True)
         (ROOT / "data" / "verification.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps(report, ensure_ascii=False))

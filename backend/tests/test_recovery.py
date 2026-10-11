@@ -102,7 +102,7 @@ def test_cooldown_survives_new_worker_session_and_api_exposes_it(sessions, clien
 
 def test_source_specific_config_and_validation():
     settings = Settings(_env_file=None)
-    assert settings.for_source("linkedin").request_delay_seconds == 10
+    assert settings.for_source("linkedin").request_delay_seconds == 30
     assert settings.for_source("linkedin").source_timeout_seconds == 3600
     assert settings.for_source("104").source_timeout_seconds == 1800
     with pytest.raises(ValueError):
@@ -220,6 +220,8 @@ def test_worker_acknowledges_list_commit_and_persists_detail_failure(sessions, m
 
 def test_runner_finishes_all_lists_before_details_and_keeps_list_on_detail_error(sessions, monkeypatch):
     from app.ingestion import runner
+    from app.ingestion.connectors import SearchPage
+    from app.ingestion.progress import checkpoint, prepare_cycle
     settings = Settings(_env_file=None, collect_keywords="one,two", source_request_delays={"linkedin":0}, request_delay_seconds=0)
     monkeypatch.setattr(runner, "get_settings", lambda:settings)
     monkeypatch.setattr(runner, "SessionLocal", sessions)
@@ -227,20 +229,27 @@ def test_runner_finishes_all_lists_before_details_and_keeps_list_on_detail_error
     class Connector:
         truncated = False
         http = object()
-        async def collect(self, keyword):
+        async def collect_page(self, keyword, page, offset):
             order.append(keyword)
-            yield linkedin("li-1" if keyword == "one" else "li-2", update_mode="listing", detail_status="pending")
+            job = linkedin("li-1" if keyword == "one" else "li-2", update_mode="listing", detail_status="pending")
+            return SearchPage([job], [job.external_id], False)
         async def close(self):
             pass
     monkeypatch.setattr(runner, "make_connector", lambda *args:Connector())
+    with sessions() as db:
+        state = SourceState(source="linkedin")
+        db.add(state)
+        prepare_cycle(db, state, settings)
+        db.commit()
     def emit(event):
         events.append(event)
-        if event["type"] == "job":
+        if event["type"] == "page":
             with sessions() as db:
-                upsert_job(db, NormalizedJob.model_validate(event["job"]))
+                checkpoint(db, db.get(SourceState, "linkedin"), event)
+                db.commit()
     monkeypatch.setattr(runner, "emit", emit)
     import io
-    monkeypatch.setattr(runner.sys, "stdin", io.StringIO("lists_saved\n"))
+    monkeypatch.setattr(runner.sys, "stdin", io.StringIO("page_saved\npage_saved\nlists_saved\n"))
     async def detail(*args):
         order.append("detail")
         raise SourceError("HTTP 429", "rate_limited", 3600)
@@ -357,7 +366,8 @@ def test_browser_search_429_is_not_empty_success():
                 return "搜尋職缺"
         class Page:
             def on(self,event,handler):
-                self.handler=handler
+                if event == "response":
+                    self.handler=handler
             def remove_listener(self,*args):
                 pass
             async def goto(self,*args,**kwargs):

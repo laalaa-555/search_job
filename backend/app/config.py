@@ -27,13 +27,17 @@ class Settings(BaseSettings):
     source_timeout_seconds: float = Field(default=1800, gt=0)
     worker_lock_seconds: int = Field(default=120, ge=30)
     status_stale_days: int = Field(default=7, ge=1)
-    source_request_delays: dict[str, float] = Field(default_factory=lambda: {"linkedin": 10})
+    source_request_delays: dict[str, float] = Field(default_factory=lambda: {"linkedin": 30, "cake": 10})
+    batch_pages_per_run: int = Field(default=6, ge=1, le=100)
     source_request_timeouts: dict[str, float] = Field(default_factory=dict)
     source_timeouts: dict[str, float] = Field(default_factory=lambda: {"linkedin": 3600})
     linkedin_detail_limit: int = Field(default=20, ge=0, le=100)
     linkedin_detail_refresh_days: int = Field(default=7, ge=1)
     rate_limit_cooldown_seconds: int = Field(default=3600, ge=3600)
     blocked_cooldown_seconds: int = Field(default=86400, ge=1)
+    source_diagnostics: bool = True
+    diagnostics_directory: str = "data/diagnostics"
+    diagnostics_max_events: int = Field(default=100, ge=10, le=1000)
 
     @field_validator("source_request_delays", "source_request_timeouts", "source_timeouts")
     @classmethod
@@ -70,6 +74,12 @@ class Settings(BaseSettings):
     @property
     def keywords(self) -> list[str]:
         return split_csv(self.collect_keywords)
+
+    def scope_hash(self, source: str) -> str:
+        import hashlib
+        import json
+        scope = [source, self.keywords, self.collect_location, self.max_results_per_keyword, self.max_pages_per_keyword]
+        return hashlib.sha256(json.dumps(scope, ensure_ascii=False).encode()).hexdigest()
 
 
 def split_csv(value: str) -> list[str]:
