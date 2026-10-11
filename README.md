@@ -76,7 +76,9 @@ Docker 前端使用同源 `/api/v1` 與 Nginx 代理。API 來源憑證、資料
 
 ## 資料來源與實測狀態
 
-五個來源都有獨立連接器。外部網站會改版、限制請求或要求驗證；程式清楚回報失敗，既有資料仍可查詢。實際驗收結果見 `modify.md`；未通過的來源不視為完成。
+五個來源都有獨立連接器。外部網站會改版、限制請求或要求驗證；程式清楚回報失敗，既有資料仍可查詢。
+
+2026-10-11 已實測 Cake、LinkedIn、Indeed 的真實職缺並寫入 PostgreSQL。104 回傳 HTTP 403／驗證頁，1111 一般 Chromium 仍停在載入／驗證頁；這兩站尚未通過真實接入驗收。LinkedIn 詳情請求曾回傳 429，會保留列表資料、停止後續請求並標示部分更新。五站全部成功的最終驗收仍未達成，詳見 `modify.md`。
 
 - 104：HTTP 讀取公開網頁使用的非官方 JSON 介面，參考 [tw-job-scraper](https://github.com/kengkeng44/tw-job-scraper)。
 - LinkedIn、Indeed：[JobSpy](https://github.com/speedyapply/JobSpy)；保存來源原始職缺網址。JobSpy 可能用 log 回報錯誤而回傳空列表，連接器會捕捉並標為失敗／部分成功。
@@ -115,7 +117,7 @@ cd backend
 ..\.venv\Scripts\python.exe -m app.worker
 ```
 
-原生 SQLite 資料檔相對於工作目錄，從 `backend` 啟動時位於 `backend/data/jobs.db`。SQLite 與 Compose PostgreSQL 為各自獨立資料庫。
+原生 SQLite 資料檔相對於工作目錄，從 `backend` 啟動時位於 `backend/data/jobs.db`。SQLite 與 Compose PostgreSQL 為各自獨立資料庫。原生 API 使用自訂連接埠時，啟動 Uvicorn 的 `--port` 需與 `.env` 的 `API_PORT` 相同；Vite 開發代理會讀取該設定。
 
 ## 測試
 
@@ -132,7 +134,17 @@ npm run test:e2e
 
 E2E 預設測試 Compose 的 `http://127.0.0.1:3000`，使用隔離的 API 測試回應，不寫入真實職缺或收藏。測試包括搜尋／取消舊請求、篩選、收藏、空結果、來源失敗及手機版。
 
-PostgreSQL 測試只能指定名稱以 `test_` 開頭的獨立資料庫；測試會建立與清除該資料庫中的測試表。執行 `docker compose exec -T api python test_postgres.py` 可在 Compose 內建立 `test_jobs`，執行與 SQLite 相同的測試。CI 也執行兩種資料庫測試。
+PostgreSQL 測試只能指定名稱以 `test_` 開頭的獨立資料庫；測試會建立與清除該資料庫中的測試表。執行 `docker compose exec -T api python test_postgres.py` 可在 Compose 內建立 `test_jobs`，執行與 SQLite 相同的測試。測試程序的預設應用資料庫另設為空白記憶體 DB，讓誤用正式 Session factory 的測試立即失敗。CI 也執行兩種資料庫測試。
+
+已通過 SQLite 19 項、PostgreSQL 19 項、桌面／手機 E2E 14 項與 Compose 建置。真實資料的容器重啟驗證可在根目錄執行：
+
+```powershell
+.\.venv\Scripts\python.exe scripts/verify_local.py
+# 驗證會暫停 Worker，完成後恢復每日排程程序
+docker compose up -d
+```
+
+此檢查使用既有真實職缺，暫存一筆收藏；重啟資料庫、API、前端後檢查並恢復原收藏狀態，不插入示範職缺。
 
 ## 備份與還原
 

@@ -14,6 +14,7 @@ flowchart LR
 
 - `frontend/`：React、TypeScript、Vite；Nginx 提供 build 並代理 `/api/` 到 API。
 - `backend/app/main.py`：REST API，只讀 DB 與操作收藏，不 import 任何收集連接器。
+- `backend/app/locations.py`：中文／英文地區別名，讓多地區職缺可按各地區搜尋，避免 New Taipei 誤判為 Taipei。
 - `backend/app/worker.py`：APScheduler、啟動收集、執行租約、子程序管理與來源狀態。
 - `backend/app/ingestion/`：各來源連接器、薪資清理、JSON-lines 子程序協議與 upsert。
 - `backend/migrations/`：Alembic。Compose migrate 成功後才啟動 API／Worker。
@@ -62,6 +63,15 @@ SQLite 啟用 WAL 與 foreign keys；PostgreSQL 使用 psycopg。真正欄位定
 Compose：db → migrate → api／worker → frontend。PostgreSQL 具名 volume 持久化；僅 frontend 及 API 的連接埠映射到 127.0.0.1，DB 不對外映射。
 
 根目錄 `.env`，Pydantic Settings 讀取；Compose 覆蓋內部 DATABASE_URL。`.env` 不進 build context 或 Git。原生開發 SQLite 與 Compose PostgreSQL 資料分離。
+
+Node 與 Python Playwright 的瀏覽器版本各自安裝；容器中的 Chromium 只屬於 Worker。API 不安裝瀏覽器。
+
+## 目前驗收界線
+
+Cake、LinkedIn、Indeed 已取得真實職缺；104／1111 在目前網路環境受阻，尚未通過真實資料驗收。連接器實作與離線解析測試不代表來源可存取。
+來源狀態以 DB 為準；完整成功時間與部分成功分開。Cake 使用 pageMap 及 total_pages，即使一頁只有其他來源轉載，也繼續處理後續頁面。
+
+測試使用 `test_*` DB 或獨立暫存 SQLite，透過 Session factory／dependency override 隔離。`test_postgres.py` 讓預設 DB 指向空白記憶體，防止誤用正式連線。
 
 ## 接手檢查
 
